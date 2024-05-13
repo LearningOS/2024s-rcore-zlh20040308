@@ -14,15 +14,15 @@ mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 
-use crate::config::MAX_APP_NUM;
+use crate::config::{MAX_APP_NUM, MAX_SYSCALL_NUM};
 use crate::loader::{get_num_app, init_app_cx};
 use crate::sync::UPSafeCell;
 use lazy_static::*;
 use switch::__switch;
+use crate::timer::get_time_ms;
 pub use task::{TaskControlBlock, TaskStatus};
 
 pub use context::TaskContext;
-
 /// The task manager, where all the tasks are managed.
 ///
 /// Functions implemented on `TaskManager` deals with all task state transitions
@@ -45,6 +45,8 @@ pub struct TaskManagerInner {
     tasks: [TaskControlBlock; MAX_APP_NUM],
     /// id of current `Running` task
     current_task: usize,
+    /// list of all tasks' start time
+    start_time_of_tasks: [usize; MAX_APP_NUM],
 }
 
 lazy_static! {
@@ -54,6 +56,7 @@ lazy_static! {
         let mut tasks = [TaskControlBlock {
             task_cx: TaskContext::zero_init(),
             task_status: TaskStatus::UnInit,
+            syscall_times: [0; MAX_SYSCALL_NUM],
         }; MAX_APP_NUM];
         for (i, task) in tasks.iter_mut().enumerate() {
             task.task_cx = TaskContext::goto_restore(init_app_cx(i));
@@ -65,6 +68,7 @@ lazy_static! {
                 UPSafeCell::new(TaskManagerInner {
                     tasks,
                     current_task: 0,
+                    start_time_of_tasks: [0; MAX_APP_NUM]
                 })
             },
         }
@@ -81,6 +85,9 @@ impl TaskManager {
         let task0 = &mut inner.tasks[0];
         task0.task_status = TaskStatus::Running;
         let next_task_cx_ptr = &task0.task_cx as *const TaskContext;
+        if inner.start_time_of_tasks[0] == 0 {
+            inner.start_time_of_tasks[0] = get_time_ms();
+        }
         drop(inner);
         let mut _unused = TaskContext::zero_init();
         // before this, we should drop local variables that must be dropped manually
@@ -125,6 +132,9 @@ impl TaskManager {
             inner.current_task = next;
             let current_task_cx_ptr = &mut inner.tasks[current].task_cx as *mut TaskContext;
             let next_task_cx_ptr = &inner.tasks[next].task_cx as *const TaskContext;
+            if inner.start_time_of_tasks[next] == 0 {
+                inner.start_time_of_tasks[next] = get_time_ms();
+            }
             drop(inner);
             // before this, we should drop local variables that must be dropped manually
             unsafe {
@@ -134,6 +144,35 @@ impl TaskManager {
         } else {
             panic!("All applications completed!");
         }
+    }
+
+
+    /// Increase_current_task_syscall_times
+    /// 
+    /// When current task is calling a system call,increases the current syscall_times
+    pub fn increase_current_task_syscall_times(&self,syscall_id:usize) {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].syscall_times[syscall_id] += 1;
+        drop(inner);
+    }
+
+    /// Returns the current task's syscall_times
+    fn get_current_task_syscall_times(&self) -> [u32; MAX_SYSCALL_NUM] {
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        let syscall_times: [u32; MAX_SYSCALL_NUM] = inner.tasks[current].syscall_times.clone();
+        drop(inner);
+        syscall_times
+    }
+
+    /// Returns the current task's start time in microseconds
+    fn get_current_task_start_time(&self) -> usize {
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        let start_time = inner.start_time_of_tasks[current];
+        drop(inner);
+        start_time
     }
 }
 
@@ -168,4 +207,19 @@ pub fn suspend_current_and_run_next() {
 pub fn exit_current_and_run_next() {
     mark_current_exited();
     run_next_task();
+}
+
+/// Increase_current_task_syscall_times
+pub fn increase_current_task_syscall_times(syscall_id:usize)  {
+    TASK_MANAGER.increase_current_task_syscall_times(syscall_id);
+}
+
+/// Returns the current task's syscall_times
+pub fn get_current_task_syscall_times() -> [u32; MAX_SYSCALL_NUM] {
+    TASK_MANAGER.get_current_task_syscall_times()
+}
+
+/// Returns the current task's start time in microseconds
+pub fn get_current_task_start_time() -> usize {
+    TASK_MANAGER.get_current_task_start_time()
 }
